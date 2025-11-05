@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# specle — simple system monitor with live mode
+
+# ─── Sudo Check ─────────────────────────
+if [[ $EUID -eq 0 ]]; then
+    echo "don't run me as sudo!"
+    exit 1
+fi
+
+# ─── Colors ──────────────────────────────
+GREEN="\e[32m"; CYAN="\e[36m"; MAGENTA="\e[35m"; YELLOW="\e[33m"; RESET="\e[0m"
+
+# ─── Help Menu ─────────────────────────
+show_help() {
+    echo -e "${CYAN}╭──────────────────────────────────────────╮${RESET}"
+    echo -e "${CYAN}│ ${MAGENTA}specle${CYAN} — simple system monitor${RESET}        ${CYAN}${RESET}"
+    echo -e "${CYAN}╰──────────────────────────────────────────╯${RESET}"
+    echo ""
+    echo -e "${YELLOW}USAGE:${RESET}"
+    echo -e "  specle [OPTIONS]"
+    echo ""
+    echo -e "${YELLOW}OPTIONS:${RESET}"
+    echo -e "  ${GREEN}--live${RESET}, ${GREEN}-l${RESET}    Start live web monitor on port 5050"
+    echo -e "  ${GREEN}--help${RESET}, ${GREEN}-h${RESET}    Show ME!!!! THE HELP MESSAGE!! ME!!!"
+    echo ""
+    echo -e "${YELLOW}DESCRIPTION:${RESET}"
+    echo -e "  Display system statistics including CPU, memory, disk usage,"
+    echo -e "  temperature, and uptime."
+    echo ""
+    echo -e "  ${GREEN}--live${RESET} mode starts a web server with real-time updates"
+    echo -e "  via WebSocket. Access it at http://localhost:5050"
+    echo ""
+    echo -e "${YELLOW}EXAMPLES:${RESET}"
+    echo -e "  specle              # Show static system stats"
+    echo -e "  specle --live      # Start live web monitor"
+    echo -e "  specle -h          # Show this help"
+    echo ""
+}
+
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    show_help
+    exit 0
+fi
+
+# ─── Handle --live mode ─────────────────
+if [[ "$1" == "--live" ]] || [[ "$1" == "-l" ]]; then
+    # Run the embedded Python server
+    python3 - <<'PYCODE'
+import psutil, platform, json, threading, time, webbrowser
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+import base64, hashlib, struct
+
+PORT = 5050
+HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Specle Live</title>
+<style>
+body{background:#111;color:#eee;font-family:monospace;text-align:center;padding:1em}
+h1{color:#6cf} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1em}
+.card{background:#222;padding:1em;border-radius:1em;box-shadow:0 0 10px #0004}
+</style>
+<script>
+let ws;function connect(){
+ ws=new WebSocket("ws://"+location.host+"/ws");
+ ws.onmessage=e=>{
+  let d=JSON.parse(e.data);
+  document.getElementById("cpu").innerText=d.cpu+"%";
+  document.getElementById("mem").innerText=d.mem_used+" / "+d.mem_total;
+  document.getElementById("disk").innerText=d.disk_used+" / "+d.disk_total;
+  document.getElementById("temp").innerText=d.temp;
+  document.getElementById("uptime").innerText=d.uptime;
+ };
+ ws.onclose=()=>setTimeout(connect,1000);
+ ws.onerror=()=>{};
+}
+window.onload=connect;
+</script></head><body>
+<h1>🌀 Specle Live Monitor</h1>
+<div class="grid">
+<div class="card"><b>CPU</b><br><span id="cpu"></span></div>
+<div class="card"><b>Memory</b><br><span id="mem"></span></div>
+<div class="card"><b>Disk</b><br><span id="disk"></span></div>
+<div class="card"><b>Temp</b><br><span id="temp"></span></div>
+<div class="card"><b>Uptime</b><br><span id="uptime"></span></div>
+</div>
+</body></html>
+"""
+
+def stats_json():
+    temp="N/A"
+    try:
+        import subprocess, re
+        out=subprocess.check_output(["sensors"]).decode(errors="ignore")
+        m=re.search(r"Package id 0:\s+\+?([0-9.]+)",out)
+        if m: temp=f"{m.group(1)}°C"
+    except Exception: pass
+    return json.dumps({
+        "cpu": round(psutil.cpu_percent(),1),
+        "mem_used": f"{psutil.virtual_memory().used//(1024**2)}MB",
+        "mem_total": f"{psutil.virtual_memory().total//(1024**2)}MB",
+        "disk_used": f"{psutil.disk_usage('/').used//(1024**3)}GB",
+        "disk_total": f"{psutil.disk_usage('/').total//(1024**3)}GB",
+        "uptime": f"{int(time.time()-psutil.boot_time())//60} min",
+        "temp": temp
+    })
+
+def create_ws_frame(data):
+    msg = data.encode() if isinstance(data, str) else data
+    msg_len = len(msg)
+    if msg_len < 126:
+        header = struct.pack('!BB', 0x81, msg_len)
+    elif msg_len < 65536:
+        header = struct.pack('!BBH', 0x81, 126, msg_len)
+    else:
+        header = struct.pack('!BBQ', 0x81, 127, msg_len)
+    return header + msg
+
+def ws_handshake(key):
+    magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    accept = base64.b64encode(hashlib.sha1((key + magic).encode()).digest()).decode()
+    return (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n"
+        "\r\n"
+    )
+
+class Handler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(HTML.encode())
+        elif self.path == "/ws":
+            self.handle_websocket()
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def handle_websocket(self):
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self.send_response(400)
+            self.end_headers()
+            return
+        
+        self.request.sendall(ws_handshake(key).encode())
+        self.request.setblocking(True)
+        
+        while True:
+            try:
+                msg = stats_json()
+                frame = create_ws_frame(msg)
+                self.request.sendall(frame)
+                time.sleep(1)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+            except Exception:
+                break
+    
+    def log_message(self, format, *args):
+        pass
+
+def run_server():
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    url = f"http://localhost:{PORT}"
+    print(f"Specle Live running → {url}")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    server.serve_forever()
+
+run_server()
+PYCODE
+    exit 0
+fi
+
+# ─── Static Stats ────────────────────────
+cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print 100 - $8"%"}')
+mem_usage=$(free -h | awk '/Mem:/ {print $3 " / " $2}')
+disk_usage=$(df -h / | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')
+uptime_info=$(uptime -p | sed 's/up //')
+temp=$(sensors 2>/dev/null | grep 'Package id 0:' | awk '{print $4}' | head -n1)
+[ -z "$temp" ] && temp="N/A"
+
+echo -e "${CYAN}╭──────────────────────────╮${RESET}"
+echo -e "${CYAN}│ ${MAGENTA}system stats${CYAN} │${RESET}"
+echo -e "${CYAN}╰──────────────────────────╯${RESET}"
+echo -e "${YELLOW}CPU:${RESET}    $cpu_usage"
+echo -e "${YELLOW}Memory:${RESET} $mem_usage"
+echo -e "${YELLOW}Disk:${RESET}   $disk_usage"
+echo -e "${YELLOW}Temp:${RESET}   $temp"
+echo -e "${YELLOW}Uptime:${RESET} $uptime_info"
